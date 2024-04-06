@@ -1,4 +1,5 @@
 # coding=utf-8
+import shlex
 import logging
 import re
 from .rest_client import AtlassianRestAPI
@@ -630,3 +631,376 @@ class Xray(AtlassianRestAPI):
         data = {"add": add, "remove": remove}
         url = self.resource_url("testrepository/{0}/folders/{1}/tests".format(project_key, folder_id))
         return self.put(url, data=data)
+
+
+class XrayCloud(AtlassianRestAPI):
+    """
+    A cloud version of the original Xray class. It implements the same methods
+    but use the graphql api under the hood.
+
+    The class is meant to be used as a TEMPORARY solution if you need to migrate from Jira Server/DC to Jira Cloud.
+
+    See `XrayCloud._resolve_issueids` for more context.
+    """
+
+    def __init__(self, **kwargs):
+
+        self.token = kwargs.get("token")
+        if self.token is None:
+            log.warning("No token given. Please make sure that you generated one before calling the api methods")
+
+        super(XrayCloud, self).__init__(
+            url="https://xray.cloud.getxray.app/api/{api_version}".format(api_version=kwargs.pop("api_version", "v2")),
+            **kwargs,
+        )
+
+    def generate_token(self, client_id: str, client_secret: str, update_session=True):
+        """
+        Call the authentification endpoint to get a new Xray Cloud Token
+
+        `client_id` : str
+            the Client Id of your API Key
+
+        `client_secret` : str
+            the Client Secret of your API Key
+
+        `update_session` : True
+            if True, we update the current session to use the generated token
+        """
+        token = self.post(path="authenticate", json={"client_id": client_id, "client_secret": client_secret})
+        if update_session:
+            self._create_token_session(self.token)
+            self.token = token
+        return token
+
+    def graphql(self, query):
+        """
+        Call directly the graphQL API
+
+        `query`: str
+            the actual graphql operation you wanna do (mutation, query...)
+        """
+        # trying to reduce the size of the query string
+        try:
+            query = " ".join(shlex.split(query, posix=False))
+        finally:
+            pass
+
+        response = self.post(path="graphql", json={"query": query})
+        return response.get("data")
+
+    def _resolve_issueids(self, issue_type, issues_keys):
+        """
+        Call the needed graphql Query to convert a list of issueKeys into issueIds.
+
+        ----
+
+        ``issue_type``: str
+            - The type of the xray issues (Test, Test Execution, Test Set, Precondition )
+
+        ``issues_keys`` : list[str]
+            - The keys that will be converted into issueIds
+        ----
+        This method purpose is to ensure retrocompatibility with the original Xray
+        to ease migration from a DC/Server Jira instance to the cloud.
+
+        This is NOT a performant solution and also why you should look for something better after you migrated
+        if performance is key for your usecase.
+
+        Example:
+            To get the Test 'TEST-1', we need to know its issueId (12345)
+            since that's the only argument we can specify in the getTest Query
+            https://xray.cloud.getxray.app/doc/graphql/gettest.doc.html
+        """
+
+        if len(issues_keys) > 100:
+            raise ValueError("The GraphQL API can only process 100 items at a time.")
+
+        query_mapping = {"test": None}
+
+        query = query_mapping.get(issue_type.lower())
+
+        if query is None:
+            supported = "Supported types are: %s" % ", ".join(
+                [key for key, value in query_mapping.items() if value is not None]
+            )
+            raise ValueError("Can't resolve ids for Xray issues of type '%s'. %s" % (issue_type, supported))
+
+        return query
+
+    def get_tests(self, test_keys):
+        """
+        Retrieve information about the provided tests.
+        :param test_keys: list of tests (eg. `['TEST-001', 'TEST-002']`) to retrieve.
+        :return: Returns the retrieved tests.
+        """
+        if len(test_keys) > 100:
+            raise ValueError("The Cloud Version can't process more than 100 items")
+
+        test_issues_query = """query {
+            getTests(jql: "issue in (%s)", limit: 100){
+                results{
+                    issueId,
+                    jira(fields: ["key"]),
+                    testType {name,kind}
+                    gherkin
+                    unstructured
+                    steps {
+                        id
+                        action
+                        data
+                        result
+                        callTestIssueId
+                        attachments {id,filename,storedInJira}
+                    }
+                }
+            }
+        }""" % ",".join(
+            test_keys
+        )
+
+        return self.graphql(test_issues_query)["getTests"]["results"]
+
+    def get_test_statuses(self):
+        """
+        Retrieve a list of all Test Statuses available in Xray sorted by rank.
+        :return: Returns the test statuses.
+        """
+        query = "query {getStatuses {name,description,final,color}}"
+        return self.graphql(query)["getStatuses"]
+
+    def get_test_runs(self, test_key):
+        """
+        Retrieve test runs of a test.
+        :param test_key: Test key (eg. 'TEST-001').
+        :return: Returns the exported test runs.
+        """
+        query = (
+            """query {
+                    getExpandedTests(limit: 1, jql: "key=%s") {
+                        results {
+                            testRuns(limit: 100) {
+                                limit
+                                results {
+                                    id
+                                    comment
+                                    startedOn
+                                    defects
+                                    executedById
+                                    assigneeId
+                                    finishedOn
+                                    lastModified
+                                    status { name }
+                                    evidence {
+                                        id
+                                        filename
+                                        storedInJira
+                                        downloadLink
+                                        createdOn
+                                    }
+                                    parameters { name value }
+                                    steps {
+                                        result
+                                        status { name }
+                                        comment
+                                        evidence {
+                                            id
+                                            filename
+                                            storedInJira
+                                            downloadLink
+                                            size
+                                            createdOn
+                                        }
+                                        defects
+                                        actualResult
+                                    }
+                                    testExecution { testEnvironments }
+                                }
+                            }
+                        }
+                    }
+                }"""
+            % test_key
+        )
+        response = self.graphql(query)
+        testruns = response["getExpandedTests"]["results"][0]["testRuns"]["results"]
+        return testruns
+
+    def get_test_runs_in_context(
+        self,
+        test_exec_key=None,
+        test_key=None,
+        test_plan_key=None,
+        include_test_fields=False,
+        saved_filter_id=None,
+        limit=100,
+        start=0,
+    ):
+        """
+        Retrieves all the Test Runs from a given context.
+
+        Disclaimer
+        ----
+        No guarantee on that one. We try to mimick the old `/testruns` endpoint
+        as best as possible but some things will not be possible on the cloud.
+
+        Use carefully since you can easily hit a items limit
+
+        Parameters
+        ----
+        test_exec_key : str
+            Use the given Test Execution to limit results
+        test_key : str
+            Use the given Test to limit results
+        test_plan_key : str
+            Use the given Test Plan to limit results
+        include_test_fields : bool
+            include customFields in the results or not
+        saved_filter_id : str
+            the id of your jira filter that contains only Test Executions issues
+        limit : 100
+            The number of testRuns to return. 100 is the actual limit of the GraphQL API
+
+        start : 0
+            The number of the first item to return (if you do pages offset)
+
+        """
+        raise NotImplementedError("TODO")
+
+    def get_test_runs_with_environment(self):
+        """
+        this method is not possible in the cloud --> testEnvironments can't be used as a filter
+        """
+        raise NotImplementedError("Not supported in the Cloud")
+
+    def get_test_preconditions(self, test_key):
+        raise NotImplementedError
+
+    def get_test_sets(self, test_key):
+        raise NotImplementedError
+
+    def get_test_executions(self, test_key):
+        raise NotImplementedError
+
+    def get_test_plans(self, test_key):
+        raise NotImplementedError
+
+    # Test Steps API
+    def get_test_step_statuses(self):
+        raise NotImplementedError
+
+    def get_test_step(self, test_key, test_step_id):
+        raise NotImplementedError
+
+    def get_test_steps(self, test_key):
+        raise NotImplementedError
+
+    def create_test_step(self, test_key, step, data, result):
+        raise NotImplementedError
+
+    def update_test_step(self, test_key, test_step_id, step, data, result):
+        raise NotImplementedError
+
+    def delete_test_step(self, test_key, test_step_id):
+        raise NotImplementedError
+
+    # Pre-Conditions API
+    def get_tests_with_precondition(self, precondition_key):
+        raise NotImplementedError
+
+    def update_precondition(self, precondition_key, add=None, remove=None):
+        raise NotImplementedError
+
+    def delete_test_from_precondition(self, precondition_key, test_key):
+        raise NotImplementedError
+
+    # Test Set API
+    def get_tests_with_test_set(self, test_set_key, limit=None, page=None):
+        raise NotImplementedError
+
+    def update_test_set(self, test_set_key, add=None, remove=None):
+        raise NotImplementedError
+
+    def delete_test_from_test_set(self, test_set_key, test_key):
+        raise NotImplementedError
+
+    # Test Plans API
+    def get_tests_with_test_plan(self, test_plan_key, limit=None, page=None):
+        raise NotImplementedError
+
+    def update_test_plan(self, test_plan_key, add=None, remove=None):
+        raise NotImplementedError
+
+    def delete_test_from_test_plan(self, test_plan_key, test_key):
+        raise NotImplementedError
+
+    def get_test_executions_with_test_plan(self, test_plan_key):
+        raise NotImplementedError
+
+    def update_test_plan_test_executions(self, test_plan_key, add=None, remove=None):
+        raise NotImplementedError
+
+    def delete_test_execution_from_test_plan(self, test_plan_key, test_exec_key):
+        raise NotImplementedError
+
+    # Test Executions API
+    def get_tests_with_test_execution(self, test_exec_key, detailed=False, limit=None, page=None):
+        raise NotImplementedError
+
+    def update_test_execution(self, test_exec_key, add=None, remove=None):
+        raise NotImplementedError
+
+    def delete_test_from_test_execution(self, test_exec_key, test_key):
+        raise NotImplementedError
+
+    # Test Runs API
+    def get_test_run(self, test_run_id):
+        raise NotImplementedError
+
+    def get_test_run_assignee(self, test_run_id):
+        raise NotImplementedError
+
+    def update_test_run_assignee(self, test_run_id, assignee):
+        raise NotImplementedError
+
+    def get_test_run_status(self, test_run_id):
+        raise NotImplementedError
+
+    def update_test_run_status(self, test_run_id, status):
+        raise NotImplementedError
+
+    def get_test_run_defects(self, test_run_id):
+        raise NotImplementedError
+
+    def update_test_run_defects(self, test_run_id, add=None, remove=None):
+        raise NotImplementedError
+
+    def get_test_run_comment(self, test_run_id):
+        raise NotImplementedError
+
+    def update_test_run_comment(self, test_run_id, comment):
+        raise NotImplementedError
+
+    def get_test_run_steps(self, test_run_id):
+        raise NotImplementedError
+
+    def get_test_repo_folders(self, project_key):
+        raise NotImplementedError
+
+    def get_test_repo_folder(self, project_key, folder_id):
+        raise NotImplementedError
+
+    def create_test_repo_folder(self, project_key, folder_name, parent_folder_id=-1):
+        raise NotImplementedError
+
+    def update_test_repo_folder(self, project_key, folder_id, folder_name, rank=1):
+        raise NotImplementedError
+
+    def delete_test_repo_folder(self, project_key, folder_id):
+        raise NotImplementedError
+
+    def get_test_repo_folder_tests(self, project_key, folder_id, all_descendants=False, page=1, limit=50):
+        raise NotImplementedError
+
+    def update_test_repo_folder_tests(self, project_key, folder_id, add=None, remove=None):
+        raise NotImplementedError
